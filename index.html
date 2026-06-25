@@ -1271,6 +1271,18 @@ async function saveToSupabase(table,data){
   const cfg=getSupaConfig();if(!cfg.ok)return false;
   try{const r=await fetch(cfg.url+'/rest/v1/'+table,{method:'POST',headers:{'Content-Type':'application/json','apikey':cfg.key,'Authorization':'Bearer '+cfg.key,'Prefer':'return=minimal'},body:JSON.stringify(data)});return r.ok;}catch{return false;}
 }
+// Upsert (insert atau update kalau cache_key sudah ada) — dipakai untuk shared API cache
+async function upsertSupabase(table,data,conflictCol){
+  const cfg=getSupaConfig();if(!cfg.ok)return false;
+  try{
+    const r=await fetch(cfg.url+'/rest/v1/'+table+'?on_conflict='+conflictCol,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','apikey':cfg.key,'Authorization':'Bearer '+cfg.key,'Prefer':'resolution=merge-duplicates,return=minimal'},
+      body:JSON.stringify(data)
+    });
+    return r.ok;
+  }catch(e){console.debug('[Upsert]',table,e.message);return false;}
+}
 async function readFromSupabase(table,filter=''){
   const cfg=getSupaConfig();if(!cfg.ok)return[];
   try{const r=await fetch(cfg.url+'/rest/v1/'+table+'?'+filter,{headers:{'apikey':cfg.key,'Authorization':'Bearer '+cfg.key}});if(r.ok)return await r.json();return[];}catch{return[];}
@@ -2524,6 +2536,23 @@ async function fetchApiFootballWithCache(endpoint, cacheKeyName, forceRefresh) {
     } catch(e) {}
   }
 
+  // Cek shared cache di Supabase — kalau ada user lain yang baru saja fetch data
+  // yang sama, kita pakai itu saja dan TIDAK perlu panggil API-Football lagi.
+  // Ini yang membuat kuota 100 req/hari aman dipakai banyak pengguna sekaligus.
+  if (!forceRefresh) {
+    try {
+      const rows = await readFromSupabase('api_cache', `cache_key=eq.${encodeURIComponent(cacheKeyName)}&select=data,updated_at`);
+      if (rows.length) {
+        const age = now - new Date(rows[0].updated_at).getTime();
+        if (age < refreshInterval) {
+          console.log(`[SharedCache] Pakai cache Supabase untuk: ${cacheKeyName}`);
+          localStorage.setItem(cacheKey, JSON.stringify({ data: rows[0].data, timestamp: now }));
+          return rows[0].data;
+        }
+      }
+    } catch(e) { console.debug('[SharedCache read]', cacheKeyName, e.message); }
+  }
+
   const token = getAfToken();
   if(!token) return null;
 
@@ -2549,6 +2578,9 @@ async function fetchApiFootballWithCache(endpoint, cacheKeyName, forceRefresh) {
         data: result.response,
         timestamp: now
       }));
+      // Tulis ke shared cache Supabase, supaya pengguna lain yang minta
+      // data sama dalam 15 menit ke depan tidak perlu panggil API-Football lagi.
+      upsertSupabase('api_cache', { cache_key: cacheKeyName, data: result.response, updated_at: new Date().toISOString() }, 'cache_key');
       return result.response;
     }
     return null;
